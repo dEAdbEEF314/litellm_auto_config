@@ -21,11 +21,13 @@ Each category registers:
 
 from __future__ import annotations
 
+import concurrent.futures
 import copy
 import json
 import logging
 import math
 import os
+import stat
 import sys
 import tempfile
 import urllib.error
@@ -74,6 +76,19 @@ BARGAIN_PRICE_INPUT_CEILING = 0.25
 
 # High capability threshold for Practical category
 PRACTICAL_MIN_INTELLIGENCE = 50.0
+
+# [S5] Maximum bytes to read from a single API response (50 MB).
+# Guards against memory exhaustion from maliciously large payloads.
+_MAX_RESPONSE_BYTES = 50 * 1024 * 1024
+
+# [S1] Allowed Discord Webhook URL prefixes (SSRF prevention).
+_DISCORD_WEBHOOK_PREFIXES = (
+    "https://discord.com/api/webhooks/",
+    "https://discordapp.com/api/webhooks/",
+)
+
+# File permission for generated config files (owner read/write only).
+_CONFIG_FILE_MODE = stat.S_IRUSR | stat.S_IWUSR  # 0o600
 
 
 # =============================================================================
@@ -151,7 +166,10 @@ CATEGORIES = {
     ),
 }
 
-PUBLIC_GROUP_NAMES = set(CATEGORIES.keys())
+PUBLIC_GROUP_NAMES = frozenset(CATEGORIES.keys())
+
+# [E5] Pre-built tuple of dynamic prefixes for efficient startswith() checks.
+_DYNAMIC_PREFIXES = tuple(f"{g}-" for g in PUBLIC_GROUP_NAMES)
 
 
 # =============================================================================
@@ -181,10 +199,31 @@ def load_env_file() -> None:
 
             key, value = line.split("=", 1)
             key = key.strip()
-            value = value.strip().strip("\"'")
+            value = value.strip()
+
+            # [S4] Only strip matching quote pairs (both ends same char).
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+                value = value[1:-1]
 
             if key and key not in os.environ:
                 os.environ[key] = value
+
+
+# =============================================================================
+# Safe HTTP Read
+# =============================================================================
+
+def _safe_read(response: Any, max_bytes: int = _MAX_RESPONSE_BYTES) -> bytes:
+    """
+    [S5] Read up to max_bytes from an HTTP response.
+    Raises ValueError if the response exceeds the limit.
+    """
+    data = response.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise ValueError(
+            f"API response exceeded size limit ({max_bytes:,} bytes)"
+        )
+    return data
 
 
 # =============================================================================
@@ -261,6 +300,22 @@ def fixed_openrouter_model_ids(base_config: dict[str, Any]) -> set[str]:
         if model_ref.startswith("openrouter/"):
             fixed.add(model_ref.removeprefix("openrouter/"))
     return fixed
+
+
+# =============================================================================
+# [E3] Pre-computed model text cache
+# =============================================================================
+
+def _cache_model_text(model: dict[str, Any]) -> None:
+    """
+    Pre-compute and cache the lower-case concatenated text fields used by
+    multiple classification functions (is_coder_model, is_reasoning_model, etc).
+    Called once per model during the preprocessing phase.
+    """
+    if "_text_lower" not in model:
+        model["_text_lower"] = " ".join(
+            str(model.get(k) or "").lower() for k in ("id", "name", "description")
+        )
 
 
 # =============================================================================
@@ -346,9 +401,8 @@ def is_coder_model(model: dict[str, Any]) -> bool:
     if coding is True:
         return True
 
-    text = " ".join(
-        str(model.get(k) or "").lower() for k in ("id", "name", "description")
-    )
+    # [E3] Use pre-cached text field.
+    text = model.get("_text_lower") or ""
     return any(
         token in text
         for token in (
@@ -368,9 +422,8 @@ def is_reasoning_model(model: dict[str, Any]) -> bool:
     if reasoning is True:
         return True
 
-    text = " ".join(
-        str(model.get(k) or "").lower() for k in ("id", "name", "description")
-    )
+    # [E3] Use pre-cached text field.
+    text = model.get("_text_lower") or ""
     return any(
         token in text
         for token in (
@@ -398,11 +451,9 @@ def is_high_capability_model(model: dict[str, Any]) -> bool:
     if intelligence is not None:
         return intelligence >= PRACTICAL_MIN_INTELLIGENCE
 
-    # Fallback when ModelGrep intelligence benchmark is not available:
-    text = " ".join(
-        str(model.get(k) or "").lower() for k in ("id", "name", "description")
-    )
-    # Exclude explicitly low-tier/mini models unless they have high intelligence
+    # Fallback when ModelGrep intelligence benchmark is not available.
+    # [E3] Use pre-cached text field.
+    text = model.get("_text_lower") or ""
     if any(k in text for k in LOW_TIER_KEYWORDS):
         return False
 
@@ -430,7 +481,7 @@ def is_interactive_model(model: dict[str, Any]) -> bool:
 
 
 # =============================================================================
-# Data Fetchers
+# Data Fetchers (with [S5] size-limited reads)
 # =============================================================================
 
 def fetch_openrouter_models() -> list[dict[str, Any]] | None:
@@ -438,13 +489,13 @@ def fetch_openrouter_models() -> list[dict[str, Any]] | None:
         OPENROUTER_API_URL,
         headers={
             "Accept": "application/json",
-            "User-Agent": "LiteLLM-Updater/5.0",
+            "User-Agent": "LiteLLM-Updater/5.1",
         },
     )
 
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+            payload = json.loads(_safe_read(response).decode("utf-8"))
 
         if not isinstance(payload, dict):
             raise TypeError("OpenRouter API response must be a JSON object")
@@ -475,13 +526,13 @@ def fetch_openrouter_discounted_models() -> set[str]:
         OPENROUTER_DISCOUNT_URL,
         headers={
             "Accept": "application/json",
-            "User-Agent": "LiteLLM-Updater/5.0",
+            "User-Agent": "LiteLLM-Updater/5.1",
         },
     )
 
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+            payload = json.loads(_safe_read(response).decode("utf-8"))
 
         if not isinstance(payload, dict):
             return set()
@@ -530,13 +581,13 @@ def fetch_openrouter_usage_rankings() -> dict[str, int]:
         headers={
             "Accept": "application/json",
             "Authorization": f"Bearer {api_key}",
-            "User-Agent": "LiteLLM-Updater/5.0",
+            "User-Agent": "LiteLLM-Updater/5.1",
         },
     )
 
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+            payload = json.loads(_safe_read(response).decode("utf-8"))
     except (
         OSError,
         TimeoutError,
@@ -604,7 +655,7 @@ def fetch_modelgrep_models() -> list[dict[str, Any]] | None:
                 },
             )
             with urllib.request.urlopen(request, timeout=30) as response:
-                payload = json.loads(response.read().decode("utf-8"))
+                payload = json.loads(_safe_read(response).decode("utf-8"))
 
             page = payload.get("data") if isinstance(payload, dict) else None
             meta = payload.get("meta") if isinstance(payload, dict) else {}
@@ -652,6 +703,70 @@ def apply_modelgrep_overlay(
 
 
 # =============================================================================
+# [E1] Parallel API fetching
+# =============================================================================
+
+def fetch_all_data() -> tuple[
+    list[dict[str, Any]] | None,
+    set[str],
+    dict[str, int],
+    list[dict[str, Any]] | None,
+]:
+    """
+    Fetch all 4 external API data sources in parallel using threads.
+    Returns (openrouter_models, discounted_slugs, popularity_ranks, modelgrep_models).
+    """
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        future_models = executor.submit(fetch_openrouter_models)
+        future_discounts = executor.submit(fetch_openrouter_discounted_models)
+        future_rankings = executor.submit(fetch_openrouter_usage_rankings)
+        future_modelgrep = executor.submit(fetch_modelgrep_models)
+
+        models = future_models.result()
+        discounts = future_discounts.result()
+        rankings = future_rankings.result()
+        modelgrep = future_modelgrep.result()
+
+    return models, discounts, rankings, modelgrep
+
+
+# =============================================================================
+# [E2] Pre-computed sort keys
+# =============================================================================
+
+@dataclass(frozen=True)
+class _ModelSortKey:
+    """Pre-computed sort fields for a single model candidate."""
+    model_id: str
+    is_discounted: bool
+    pop_rank: int
+    intelligence: float
+    created: int
+    total_price: float
+
+
+def _precompute_sort_keys(
+    candidates: list[dict[str, Any]],
+    popularity_ranks: dict[str, int],
+    discounted_slugs: set[str],
+) -> dict[str, _ModelSortKey]:
+    """Build a lookup of pre-computed sort keys keyed by model id."""
+    keys: dict[str, _ModelSortKey] = {}
+    for m in candidates:
+        mid = str(m.get("id") or "")
+        if mid and mid not in keys:
+            keys[mid] = _ModelSortKey(
+                model_id=mid,
+                is_discounted=mid in discounted_slugs,
+                pop_rank=popularity_rank(m, popularity_ranks),
+                intelligence=mg_aa(m, "intelligence") or 0.0,
+                created=get_created(m),
+                total_price=total_price(m),
+            )
+    return keys
+
+
+# =============================================================================
 # Category Selection & Rankings
 # =============================================================================
 
@@ -662,11 +777,12 @@ def build_category_rankings(
     discounted_slugs: set[str],
 ) -> dict[str, list[dict[str, Any]]]:
     """
-    Select TOP_N (3) models for each category:
-    1. popularity : Popularity (weekly tokens) desc, discount prioritized, free excluded.
-    2. practical  : High capability (intel >= 50), Popularity desc, discount prioritized.
-    3. great_deal : Currently discounted (or low-cost proxy), lowest price asc, popularity desc.
+    Select TOP_N (3) models for each category.
     """
+    # [E3] Pre-cache text fields for all models.
+    for model in models:
+        _cache_model_text(model)
+
     valid_candidates: list[dict[str, Any]] = []
     for model in models:
         model_id = str(model.get("id") or "").strip()
@@ -678,6 +794,14 @@ def build_category_rankings(
             continue
         valid_candidates.append(model)
 
+    # [E2] Pre-compute sort keys once for all candidates.
+    sort_keys = _precompute_sort_keys(
+        valid_candidates, popularity_ranks, discounted_slugs
+    )
+
+    def _get_key(m: dict[str, Any]) -> _ModelSortKey:
+        return sort_keys[str(m.get("id") or "")]
+
     results: dict[str, list[dict[str, Any]]] = {name: [] for name in CATEGORIES}
 
     # -------------------------------------------------------------------------
@@ -686,11 +810,11 @@ def build_category_rankings(
     pop_candidates = list(valid_candidates)
     pop_candidates.sort(
         key=lambda m: (
-            0 if str(m.get("id") or "") in discounted_slugs else 1,
-            popularity_rank(m, popularity_ranks),
-            -get_created(m),
-            total_price(m),
-            str(m.get("id")),
+            not (k := _get_key(m)).is_discounted,  # True sorts after False
+            k.pop_rank,
+            -k.created,
+            k.total_price,
+            k.model_id,
         )
     )
     results["popularity"] = pop_candidates[:TOP_N]
@@ -699,18 +823,17 @@ def build_category_rankings(
     # 2. Practical Category (High capability + Popularity)
     # -------------------------------------------------------------------------
     prac_candidates = [m for m in valid_candidates if is_high_capability_model(m)]
-    # Fallback to pop_candidates if practical list is empty
     if not prac_candidates:
         prac_candidates = list(valid_candidates)
 
     prac_candidates.sort(
         key=lambda m: (
-            0 if str(m.get("id") or "") in discounted_slugs else 1,
-            popularity_rank(m, popularity_ranks),
-            -(mg_aa(m, "intelligence") or 0.0),
-            -get_created(m),
-            total_price(m),
-            str(m.get("id")),
+            not (k := _get_key(m)).is_discounted,
+            k.pop_rank,
+            -k.intelligence,
+            -k.created,
+            k.total_price,
+            k.model_id,
         )
     )
     results["practical"] = prac_candidates[:TOP_N]
@@ -719,32 +842,35 @@ def build_category_rankings(
     # 3. Great Deal Category (Special price + Low cost + Popularity)
     # -------------------------------------------------------------------------
     deal_candidates = [
-        m for m in valid_candidates if str(m.get("id") or "") in discounted_slugs
+        m for m in valid_candidates if _get_key(m).is_discounted
     ]
 
-    # If discounted models are fewer than TOP_N, supplement with low-cost candidates
+    # [E4] Use set for O(1) existence checks during supplementation.
+    deal_ids: set[str] = {str(m.get("id") or "") for m in deal_candidates}
+
     if len(deal_candidates) < TOP_N:
         supplement = [
             m
             for m in valid_candidates
-            if m not in deal_candidates
+            if str(m.get("id") or "") not in deal_ids
             and sale_price(m)[0] <= BARGAIN_PRICE_INPUT_CEILING
         ]
         deal_candidates.extend(supplement)
+        deal_ids.update(str(m.get("id") or "") for m in supplement)
 
-    # If still fewer, supplement from cheapest valid candidates
     if len(deal_candidates) < TOP_N:
         deal_candidates.extend(
-            [m for m in valid_candidates if m not in deal_candidates]
+            m for m in valid_candidates
+            if str(m.get("id") or "") not in deal_ids
         )
 
     deal_candidates.sort(
         key=lambda m: (
-            0 if str(m.get("id") or "") in discounted_slugs else 1,
-            total_price(m),
-            popularity_rank(m, popularity_ranks),
-            -get_created(m),
-            str(m.get("id")),
+            not (k := _get_key(m)).is_discounted,
+            k.total_price,
+            k.pop_rank,
+            -k.created,
+            k.model_id,
         )
     )
     results["great_deal"] = deal_candidates[:TOP_N]
@@ -901,6 +1027,14 @@ def build_dynamic_entries(
 # Discord Notification
 # =============================================================================
 
+def _validate_webhook_url(url: str) -> bool:
+    """
+    [S1] Validate that the Discord webhook URL points to a legitimate
+    Discord endpoint, preventing SSRF attacks against internal services.
+    """
+    return url.startswith(_DISCORD_WEBHOOK_PREFIXES)
+
+
 def _truncate_text(value: Any, limit: int) -> str:
     text = " ".join(str(value or "").split())
     if len(text) <= limit:
@@ -943,6 +1077,14 @@ def send_discord_notification(
     webhook_url = os.environ.get(DISCORD_WEBHOOK_ENV, "").strip()
     if not webhook_url:
         logger.info("DISCORD_WEBHOOK_URL 未設定のため通知をスキップします")
+        return
+
+    # [S1] SSRF prevention: only allow known Discord webhook endpoints.
+    if not _validate_webhook_url(webhook_url):
+        logger.error(
+            "DISCORD_WEBHOOK_URL が正規の Discord Webhook URL ではありません "
+            "(https://discord.com/api/webhooks/ で始まる必要があります)。通知をスキップします。"
+        )
         return
 
     group_colors = {
@@ -989,12 +1131,12 @@ def send_discord_notification(
                 headers={
                     "Accept": "application/json",
                     "Content-Type": "application/json",
-                    "User-Agent": "LiteLLM-Notifier/5.0",
+                    "User-Agent": "LiteLLM-Notifier/5.1",
                 },
                 method="POST",
             )
             with urllib.request.urlopen(request, timeout=15) as response:
-                response.read()
+                _safe_read(response)
             logger.info("Discord 通知送信成功: [%s]", group_name)
         except Exception as exc:
             logger.warning("Discord 通知失敗 [%s]: %s", group_name, exc)
@@ -1017,11 +1159,10 @@ def remove_dynamic_entries(model_list: list[Any]) -> list[Any]:
         if model_name in PUBLIC_GROUP_NAMES:
             continue
 
-        # Remove dynamically prefixed names
-        if any(
-            model_name.startswith(f"{g}-")
-            for g in PUBLIC_GROUP_NAMES
-        ) or model_name.startswith("openrouter-"):
+        # [E5] Remove dynamically prefixed names with pre-built tuple.
+        if model_name.startswith(_DYNAMIC_PREFIXES) or model_name.startswith(
+            "openrouter-"
+        ):
             continue
 
         cleaned.append(entry)
@@ -1105,19 +1246,16 @@ def main() -> int:
 
     fixed_ids = fixed_openrouter_model_ids(base_config)
 
-    # 1. Fetch OpenRouter catalog
-    models = fetch_openrouter_models()
+    # [E1] Fetch all 4 external APIs in parallel.
+    models, discounted_slugs, popularity_ranks, mg_models = fetch_all_data()
+
     if not models:
         logger.error("OpenRouter カタログ取得失敗により更新を中断します")
         return 1
 
-    # 2. Fetch overlays & signals
-    discounted_slugs = fetch_openrouter_discounted_models()
-    popularity_ranks = fetch_openrouter_usage_rankings()
-    mg_models = fetch_modelgrep_models()
     models = apply_modelgrep_overlay(models, mg_models)
 
-    # 3. Build dynamic configuration elements
+    # Build dynamic configuration elements
     (
         dynamic_entries,
         dynamic_fallbacks,
@@ -1127,11 +1265,11 @@ def main() -> int:
         models, fixed_ids, popularity_ranks, discounted_slugs
     )
 
-    # 4. Merge & Validate
+    # Merge & Validate
     merged_config = merge_config(base_config, dynamic_entries, dynamic_fallbacks)
     validate_config(merged_config)
 
-    # 5. Atomic write
+    # [S2/S3] Atomic write with restrictive file permissions.
     output_dir = OUTPUT_YAML_PATH.parent.resolve()
     fd, temp_path_str = tempfile.mkstemp(
         prefix="config.", suffix=".yaml.tmp", dir=str(output_dir), text=True
@@ -1139,6 +1277,9 @@ def main() -> int:
     temp_path = Path(temp_path_str)
 
     try:
+        # [S2] Immediately restrict permissions before writing any content.
+        os.fchmod(fd, _CONFIG_FILE_MODE)
+
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             yaml.safe_dump(
                 merged_config,
@@ -1156,6 +1297,10 @@ def main() -> int:
             raise TypeError("Generated YAML is not a mapping")
 
         temp_path.replace(OUTPUT_YAML_PATH)
+
+        # [S3] Ensure final file also has restricted permissions.
+        OUTPUT_YAML_PATH.chmod(_CONFIG_FILE_MODE)
+
         logger.info("設定ファイルを正常に更新しました: %s", OUTPUT_YAML_PATH)
     except Exception as exc:
         logger.error("設定ファイル書き込み失敗: %s", exc)
@@ -1163,7 +1308,7 @@ def main() -> int:
             temp_path.unlink()
         return 1
 
-    # 6. Send Discord Notification
+    # Send Discord Notification
     send_discord_notification(notification_items)
 
     return 0
