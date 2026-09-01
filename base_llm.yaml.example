@@ -1,0 +1,107 @@
+# ==============================================================================
+# LiteLLM Proxy ベース設定ファイル (base_llm.yaml.example)
+# ==============================================================================
+#
+# 【概要と使い方】
+# 1. このファイルを `base_llm.yaml` にコピーして利用します。
+#    cp base_llm.yaml.example base_llm.yaml
+# 2. ローカルで稼働している Ollama モデルや、固定で登録したいモデルを記述します。
+# 3. `update_config.py` は、この `base_llm.yaml` を読み込み、
+#    OpenRouter から動的に選定したモデル（Popularity, Practical, Great Deal）を
+#    追加・合成して `config.yaml` を自動生成します。
+#
+# ※ base_llm.yaml はローカル固有のIPアドレス等を含むため、Git 管理外（.gitignore）です。
+# ==============================================================================
+
+
+# ==============================================================================
+# 1. 固定・ローカルモデル一覧 (model_list)
+# ==============================================================================
+model_list:
+
+  # ---------------------------------------------------------------------------
+  # [設定例1] ローカル Ollama モデル（コード検証・小型）
+  # ---------------------------------------------------------------------------
+  # model_name: LiteLLM 側で公開するモデル名（クライアントが指定する名前）
+  # litellm_params:
+  #   model: "ollama/<Ollama上のモデル名>"
+  #   api_base: Ollama サーバーの URL (ホストマシンからの場合は localhost、
+  #             Docker コンテナ内からの場合は http://host.docker.internal:11434 や実IP)
+  - model_name: local-code-validator
+    litellm_params:
+      model: ollama/qwen2.5-coder:7b
+      api_base: http://localhost:11434
+
+  # ---------------------------------------------------------------------------
+  # [設定例2] ローカル Ollama モデル（ツール呼び出し・関数実行対応）
+  # ---------------------------------------------------------------------------
+  # supports_function_calling: LiteLLM 側でツール呼び出し（Function Calling）を有効化
+  # drop_params: プロバイダーが非対応の未定義パラメータを自動除去してエラーを防ぐ
+  - model_name: local-worker-coder
+    litellm_params:
+      model: ollama/qwen2.5-coder:14b
+      api_base: http://localhost:11434
+      supports_function_calling: true
+      drop_params: true
+
+  # ---------------------------------------------------------------------------
+  # [設定例3] 高速処理用軽量モデル
+  # ---------------------------------------------------------------------------
+  - model_name: local-fast-runner
+    litellm_params:
+      model: ollama/llama3.2:3b
+      api_base: http://localhost:11434
+
+  # ---------------------------------------------------------------------------
+  # [設定例4] ローカル埋め込み（Embedding）モデル
+  # ---------------------------------------------------------------------------
+  - model_name: text-embedding
+    litellm_params:
+      model: ollama/bge-m3:latest
+      api_base: http://localhost:11434
+
+
+# ==============================================================================
+# 2. ルーター・フォールバック設定 (router_settings)
+# ==============================================================================
+router_settings:
+
+  # ルーティング戦略 (simple-shuffle, latency-based-routing, usage-based-routing-v2 など)
+  routing_strategy: simple-shuffle
+
+  # 一時的なネットワークエラーやレート制限時の再試行回数
+  num_retries: 2
+
+  # リクエストのタイムアウト秒数
+  timeout: 180
+
+  # フォールバック設定（動的モデル用ルールは update_config.py が自動生成・マージします）
+  fallbacks: []
+
+
+# ==============================================================================
+# 3. LiteLLM 全体挙動設定 (litellm_settings)
+# ==============================================================================
+litellm_settings:
+
+  # プロバイダー非対応の余剰パラメータを自動除外
+  drop_params: true
+
+  # LiteLLM レベルでの最大リトライ回数
+  num_retries: 2
+  default_max_retries: 2
+
+  # リクエストタイムアウト
+  request_timeout: 180
+
+  # 詳細ログの出力 (検証時は true、安定運用時は false を推奨)
+  set_verbose: false
+
+
+# ==============================================================================
+# 4. 全般設定 (general_settings)
+# ==============================================================================
+general_settings:
+
+  # LiteLLM Proxy の認証キー (.env の LITELLM_MASTER_KEY から読み込みます)
+  master_key: os.environ/LITELLM_MASTER_KEY
