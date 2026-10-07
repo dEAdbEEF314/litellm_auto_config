@@ -18,7 +18,7 @@ services:
       - "--config=/app/config.yaml"
     restart: always
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:4000/health/liveliness || exit 1"]
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4000/health/liveliness')"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -51,17 +51,20 @@ services:
       - "6333:6333"
       - "6334:6334"
     environment:
+      - LITELLM_REQUEST_TIMEOUT=600 
       - TZ=Asia/Tokyo
     volumes:
-      - /mnt/data/docker-ssd/qdrant_storage:/qdrant/storage
+      - qdrant_storage:/qdrant/storage
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:6333/readyz || exit 1"]
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/6333' || exit 1"]
       interval: 30s
-      timeout: 10s
+      timeout: 180s
       retries: 3
       start_period: 10s
 
 volumes:
   postgres_data:
     name: litellm_postgres_data
+  qdrant_storage:
+    name: litellm_qdrant_storage
 

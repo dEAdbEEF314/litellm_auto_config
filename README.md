@@ -10,9 +10,10 @@ OpenRouter の最新利用データ（人気度・特別割引）およびベン
   - ローカル LLM（Ollama 等）とクラウド LLM（OpenRouter、Anthropic 等）を単一の OpenAI 互換エンドポイント (`http://localhost:4000/v1`) に集約します。
 - **動的モデル選定・自動更新 (`update_config.py`)**:
   - OpenRouter のカタログと週間トークン消費量、および特別割引セール情報を解析し、用途別の 3 カテゴリ（各 3 モデル）を自動選定して `config.yaml` を生成します。
-  - **`popularity`**: 総合人気モデル（特別割引優先）
-  - **`practical`**: 高機能・実用モデル（知性指数 50+、推論モデル、特別割引優先）
+  - **`popularity`**: 総合人気モデル（特別割引優先・最優先枠）
   - **`great_deal`**: 特別割引中の格安・高コスパモデル（最安順＆人気順）
+  - **`practical`**: 高機能・実用モデル（知性指数 50+、推論モデル、特別割引優先）
+  ※ カテゴリ間でモデルの重複は発生しません（選定優先度: `popularity > great_deal > practical`）。
 - **自動フォールバックと冗長化**:
   - 各カテゴリの 1 位モデルで障害やレート制限が発生した場合、自動的に 2 位・3 位のモデルへとフォールバックします。
 - **Discord 通知**:
@@ -123,12 +124,12 @@ VS Code (Continue, Roo Code, Cline)、Zoo Code、Cursor、または Python/TypeS
 - **指定可能なモデル名**:
   1. **カテゴリ代表名（自動フォールバック対応・推奨）**:
      - `popularity` : 総合人気枠 1位（障害時は 2位 → 3位 へ自動フォールバック）
-     - `practical` : 高機能実用枠 1位（障害時は 2位 → 3位 へ自動フォールバック）
      - `great_deal` : 特別割引格安枠 1位（障害時は 2位 → 3位 へ自動フォールバック）
+     - `practical` : 高機能実用枠 1位（障害時は 2位 → 3位 へ自動フォールバック）
   2. **個別モデル名（名指し指定）**:
      - `popularity-<provider>-<model>` (例: `popularity-deepseek-chat`)
-     - `practical-<provider>-<model>` (例: `practical-google-gemini-3.7-flash`)
      - `great_deal-<provider>-<model>` (例: `great_deal-inclusionai-ling-3.0-flash`)
+     - `practical-<provider>-<model>` (例: `practical-google-gemini-3.7-flash`)
   3. **ローカルモデル**:
      - `base_llm.yaml` に定義した名前（例: `local-worker-coder`）
 
@@ -153,8 +154,9 @@ curl http://localhost:4000/v1/chat/completions \
 定期的に `update_config.py` を実行してモデル一覧を最新化し、LiteLLM に反映させる場合は、cron に以下のように登録します。
 
 ```bash
-# 毎日朝6時にモデル設定を自動更新する例
-0 6 * * * cd /home/sexyroot/docker-dir/litellm && /home/sexyroot/.local/bin/uv run python update_config.py >> /tmp/update_config.log 2>&1
+# 6/9/12/15/18/21/0 時15分にモデル設定を自動更新する例
+15 0,6,9,12,15,18,21 * * * cd /home/sexyroot/docker-base/litellm && ./run_update.sh > /dev/null 2>&1
 ```
 
+※ `run_update.sh` 内で `logs/update_YYYY-MM.log` へ実行ごとに追記出力され、月ごとに自動ローテーション（過去月は gzip 圧縮・180日保持）されます。
 ※ LiteLLM は `config.yaml` の更新を自動検知してリロードするか、コンテナ再起動で反映されます。

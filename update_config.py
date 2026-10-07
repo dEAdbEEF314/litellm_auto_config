@@ -9,14 +9,14 @@
 """
 LiteLLM / Zoo Code dynamic configuration generator.
 
-Categories:
+Categories (Prioritized selection without cross-category duplicates: popularity > great_deal > practical):
 1. popularity   : Top token-consumption models (weekly usage), discounted prioritized.
-2. practical    : High-capability & intelligent models (benchmark-backed), discounted prioritized.
-3. great_deal   : Currently discounted (special price) models, sorted by lowest price & popularity.
+2. great_deal   : Currently discounted (special price) models, sorted by lowest price & popularity.
+3. practical    : High-capability & intelligent models (benchmark-backed), discounted prioritized.
 
 Each category registers:
-- A primary group entry ('popularity', 'practical', 'great_deal') with automatic fallback to #2 and #3.
-- Individual direct entries ('popularity-<model>', 'practical-<model>', 'great_deal-<model>').
+- A primary group entry ('popularity', 'great_deal', 'practical') with automatic fallback to #2 and #3.
+- Individual direct entries ('popularity-<model>', 'great_deal-<model>', 'practical-<model>').
 """
 
 from __future__ import annotations
@@ -154,15 +154,15 @@ CATEGORIES = {
         display_title="🔥 Popularity (総合人気枠)",
         description="週間トークン消費量上位の人気モデル（特別割引優先）",
     ),
-    "practical": CategoryConfig(
-        name="practical",
-        display_title="⚡ Practical (高機能・実用枠)",
-        description="知性ベンチマーク50+の実用的・高機能モデル（特別割引優先）",
-    ),
     "great_deal": CategoryConfig(
         name="great_deal",
         display_title="🏷️ Great Deal (格安・特別割引枠)",
         description="特別割引中の格安・高コスパモデル（最安＆人気順）",
+    ),
+    "practical": CategoryConfig(
+        name="practical",
+        display_title="⚡ Practical (高機能・実用枠)",
+        description="知性ベンチマーク50+の実用的・高機能モデル（特別割引優先）",
     ),
 }
 
@@ -803,11 +803,14 @@ def build_category_rankings(
         return sort_keys[str(m.get("id") or "")]
 
     results: dict[str, list[dict[str, Any]]] = {name: [] for name in CATEGORIES}
+    assigned_ids: set[str] = set()
 
     # -------------------------------------------------------------------------
-    # 1. Popularity Category
+    # 1. Popularity Category (Priority 1)
     # -------------------------------------------------------------------------
-    pop_candidates = list(valid_candidates)
+    pop_candidates = [
+        m for m in valid_candidates if str(m.get("id") or "") not in assigned_ids
+    ]
     pop_candidates.sort(
         key=lambda m: (
             not (k := _get_key(m)).is_discounted,  # True sorts after False
@@ -818,13 +821,70 @@ def build_category_rankings(
         )
     )
     results["popularity"] = pop_candidates[:TOP_N]
+    assigned_ids.update(str(m.get("id") or "") for m in results["popularity"])
 
     # -------------------------------------------------------------------------
-    # 2. Practical Category (High capability + Popularity)
+    # 2. Great Deal Category (Priority 2: Special price + Low cost + Popularity)
     # -------------------------------------------------------------------------
-    prac_candidates = [m for m in valid_candidates if is_high_capability_model(m)]
-    if not prac_candidates:
-        prac_candidates = list(valid_candidates)
+    deal_candidates = [
+        m
+        for m in valid_candidates
+        if str(m.get("id") or "") not in assigned_ids and _get_key(m).is_discounted
+    ]
+
+    # [E4] Use set for O(1) existence checks during supplementation.
+    deal_ids: set[str] = {str(m.get("id") or "") for m in deal_candidates}
+
+    if len(deal_candidates) < TOP_N:
+        supplement = [
+            m
+            for m in valid_candidates
+            if str(m.get("id") or "") not in assigned_ids
+            and str(m.get("id") or "") not in deal_ids
+            and sale_price(m)[0] <= BARGAIN_PRICE_INPUT_CEILING
+        ]
+        deal_candidates.extend(supplement)
+        deal_ids.update(str(m.get("id") or "") for m in supplement)
+
+    if len(deal_candidates) < TOP_N:
+        supplement_rest = [
+            m
+            for m in valid_candidates
+            if str(m.get("id") or "") not in assigned_ids
+            and str(m.get("id") or "") not in deal_ids
+        ]
+        deal_candidates.extend(supplement_rest)
+        deal_ids.update(str(m.get("id") or "") for m in supplement_rest)
+
+    deal_candidates.sort(
+        key=lambda m: (
+            not (k := _get_key(m)).is_discounted,
+            k.total_price,
+            k.pop_rank,
+            -k.created,
+            k.model_id,
+        )
+    )
+    results["great_deal"] = deal_candidates[:TOP_N]
+    assigned_ids.update(str(m.get("id") or "") for m in results["great_deal"])
+
+    # -------------------------------------------------------------------------
+    # 3. Practical Category (Priority 3: High capability + Popularity)
+    # -------------------------------------------------------------------------
+    prac_candidates = [
+        m
+        for m in valid_candidates
+        if str(m.get("id") or "") not in assigned_ids
+        and is_high_capability_model(m)
+    ]
+    if len(prac_candidates) < TOP_N:
+        prac_ids = {str(m.get("id") or "") for m in prac_candidates}
+        prac_candidates.extend(
+            m
+            for m in valid_candidates
+            if str(m.get("id") or "") not in assigned_ids
+            and str(m.get("id") or "") not in prac_ids
+        )
 
     prac_candidates.sort(
         key=lambda m: (
@@ -837,43 +897,7 @@ def build_category_rankings(
         )
     )
     results["practical"] = prac_candidates[:TOP_N]
-
-    # -------------------------------------------------------------------------
-    # 3. Great Deal Category (Special price + Low cost + Popularity)
-    # -------------------------------------------------------------------------
-    deal_candidates = [
-        m for m in valid_candidates if _get_key(m).is_discounted
-    ]
-
-    # [E4] Use set for O(1) existence checks during supplementation.
-    deal_ids: set[str] = {str(m.get("id") or "") for m in deal_candidates}
-
-    if len(deal_candidates) < TOP_N:
-        supplement = [
-            m
-            for m in valid_candidates
-            if str(m.get("id") or "") not in deal_ids
-            and sale_price(m)[0] <= BARGAIN_PRICE_INPUT_CEILING
-        ]
-        deal_candidates.extend(supplement)
-        deal_ids.update(str(m.get("id") or "") for m in supplement)
-
-    if len(deal_candidates) < TOP_N:
-        deal_candidates.extend(
-            m for m in valid_candidates
-            if str(m.get("id") or "") not in deal_ids
-        )
-
-    deal_candidates.sort(
-        key=lambda m: (
-            not (k := _get_key(m)).is_discounted,
-            k.total_price,
-            k.pop_rank,
-            -k.created,
-            k.model_id,
-        )
-    )
-    results["great_deal"] = deal_candidates[:TOP_N]
+    assigned_ids.update(str(m.get("id") or "") for m in results["practical"])
 
     return results
 
@@ -882,13 +906,53 @@ def build_category_rankings(
 # Config Entry Builders
 # =============================================================================
 
+def extract_model_info(
+    model: dict[str, Any],
+    description: str | None = None,
+) -> dict[str, Any]:
+    model_id = str(model.get("id") or "")
+    model_name = str(model.get("name") or model_id)
+
+    model_info: dict[str, Any] = {
+        "description": description or f"{model_name} ({model_id})",
+        "supports_vision": is_vision_model(model),
+    }
+
+    context_length = get_context_length(model)
+    if context_length > 0:
+        model_info["max_input_tokens"] = context_length
+
+    mg_price = mg_pricing(model)
+    if mg_price is not None:
+        input_per_m, output_per_m = mg_price
+        model_info["input_cost_per_token"] = input_per_m / 1_000_000.0
+        model_info["output_cost_per_token"] = output_per_m / 1_000_000.0
+    else:
+        pricing = model.get("pricing") or {}
+        if isinstance(pricing, dict):
+            try:
+                model_info["input_cost_per_token"] = float(pricing.get("prompt") or 0.0)
+                model_info["output_cost_per_token"] = float(
+                    pricing.get("completion") or 0.0
+                )
+            except (TypeError, ValueError):
+                pass
+
+    return model_info
+
+
 def make_individual_model_entry(
     model: dict[str, Any],
     prefix: str,
 ) -> dict[str, Any]:
     model_id = str(model["id"])
+    model_name = str(model.get("name") or model_id)
     return {
         "model_name": model_id_to_name(model_id, prefix=prefix),
+        "model_info": extract_model_info(
+            model,
+            description=f"Direct model for [{prefix}]: {model_name}",
+        ),
         "litellm_params": {
             "model": f"openrouter/{model_id}",
             "api_key": "os.environ/OPENROUTER_API_KEY",
@@ -904,33 +968,12 @@ def make_public_group_entry(
     cat = CATEGORIES.get(group_name)
     title = cat.display_title if cat else group_name
 
-    model_info: dict[str, Any] = {
-        "description": f"Dynamic {title} primary: {primary_model.get('name') or model_id}",
-        "supports_vision": is_vision_model(primary_model),
-    }
-
-    context_length = get_context_length(primary_model)
-    if context_length > 0:
-        model_info["max_input_tokens"] = context_length
-
-    mg_price = mg_pricing(primary_model)
-    if mg_price is not None:
-        input_per_m, output_per_m = mg_price
-        model_info["input_cost_per_token"] = input_per_m / 1_000_000.0
-        model_info["output_cost_per_token"] = output_per_m / 1_000_000.0
-    else:
-        pricing = primary_model.get("pricing") or {}
-        try:
-            model_info["input_cost_per_token"] = float(pricing.get("prompt") or 0.0)
-            model_info["output_cost_per_token"] = float(
-                pricing.get("completion") or 0.0
-            )
-        except (TypeError, ValueError):
-            pass
-
     return {
         "model_name": group_name,
-        "model_info": model_info,
+        "model_info": extract_model_info(
+            primary_model,
+            description=f"Dynamic {title} primary: {primary_model.get('name') or model_id}",
+        ),
         "litellm_params": {
             "model": f"openrouter/{model_id}",
             "api_key": "os.environ/OPENROUTER_API_KEY",
@@ -1089,8 +1132,8 @@ def send_discord_notification(
 
     group_colors = {
         "popularity": 15158332,  # Red/Orange
-        "practical": 3447003,    # Blue
         "great_deal": 3066993,   # Green
+        "practical": 3447003,    # Blue
     }
 
     items_by_group: dict[str, list[dict[str, Any]]] = {
